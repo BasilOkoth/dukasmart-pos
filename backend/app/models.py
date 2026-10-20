@@ -100,3 +100,10 @@ class FiscalInvoice(Base):
     provider: Mapped[str]=mapped_column(String(50),default='MOCK')
     external_reference: Mapped[str|None]=mapped_column(String(100),nullable=True)
     provider_response: Mapped[str|None]=mapped_column(Text,nullable=True)
+
+class StaffBranch(Base):
+    __tablename__='staff_branches'
+    id: Mapped[str]=mapped_column(String(36),primary_key=True,default=uid)
+    membership_id: Mapped[str]=mapped_column(ForeignKey('memberships.id',ondelete='CASCADE'),index=True)
+    branch_id: Mapped[str]=mapped_column(ForeignKey('branches.id',ondelete='CASCADE'),index=True)
+    __table_args__=(UniqueConstraint('membership_id','branch_id'),)

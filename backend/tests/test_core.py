@@ -35,3 +35,33 @@ def test_tenant_isolation_and_sale(tmp_path):
     assert c.get('/api/v1/inventory?branch_id='+branch,headers=a).json()[0]['qty']==3
     assert c.get('/api/v1/sales',headers=b).json()==[]
     assert c.post('/api/v1/sales',headers=a,json={**payload,'idempotency_key':'checkout-002-'+tag,'items':[{'product_id':p['id'],'quantity':8}]}).status_code==409
+
+def test_branches_staff_and_transfers():
+    import uuid
+    c=TestClient(app)
+    tag=uuid.uuid4().hex[:9]
+    email=f'owner{tag}@example.com'
+    assert c.post('/api/v1/auth/register',json={'business_name':'Branches Test','slug':'branches-'+tag,'email':email,'password':'StrongTestPassword123!'}).status_code==201
+    token=c.post('/api/v1/auth/login',json={'email':email,'password':'StrongTestPassword123!'}).json()['access_token']
+    h={'Authorization':'Bearer '+token}
+    a=c.get('/api/v1/branches',headers=h).json()[0]['id']
+    r=c.post('/api/v1/branches',headers=h,json={'name':'Outlet Two','code':'TWO'})
+    assert r.status_code==201,r.text
+    b=r.json()['id']
+    product=c.post('/api/v1/products',headers=h,json={'name':'Rice','sku':'RICE'+tag,'price':'200','cost':'100'}).json()['id']
+    assert c.post('/api/v1/inventory/receive',headers=h,json={'branch_id':a,'product_id':product,'quantity':30}).status_code==201
+    t=c.post('/api/v1/inventory/transfer',headers=h,json={'source_branch_id':a,'destination_branch_id':b,'product_id':product,'quantity':12,'reason':'Replenish outlet'})
+    assert t.status_code==201,t.text
+    assert c.get('/api/v1/inventory?branch_id='+a,headers=h).json()[0]['qty']==18
+    assert c.get('/api/v1/inventory?branch_id='+b,headers=h).json()[0]['qty']==12
+    staff_email=f'cashier{tag}@example.com'
+    result=c.post('/api/v1/staff',headers=h,json={'email':staff_email,'password':'StrongTestPassword123!','role':'CASHIER','branch_ids':[b]})
+    assert result.status_code==201,result.text
+    staff_token=c.post('/api/v1/auth/login',json={'email':staff_email,'password':'StrongTestPassword123!'}).json()['access_token']
+    sh={'Authorization':'Bearer '+staff_token}
+    assert len(c.get('/api/v1/branches',headers=sh).json())==1
+    assert c.get('/api/v1/inventory?branch_id='+a,headers=sh).status_code==403
+    assert c.get('/api/v1/inventory?branch_id='+b,headers=sh).status_code==200
+    assert c.post('/api/v1/branches',headers=sh,json={'name':'Wrong','code':'NO'}).status_code==403
+    assert c.get('/api/v1/staff',headers=sh).status_code==403
+    assert c.post('/api/v1/inventory/transfer',headers=h,json={'source_branch_id':a,'destination_branch_id':b,'product_id':product,'quantity':100,'reason':'Too many units'}).status_code==409

@@ -85,3 +85,26 @@ The UI uses responsive emerald/teal styling, modern dashboards, accessible label
 - **Download CSV** exports the inventory list; **Download history** exports recent stock movements for the selected branch.
 - Existing PostgreSQL tables remain compatible; no destructive migrations are required for these endpoints.
 - On Render, keep `VITE_API_URL` set to the actual API URL (e.g. `https://dukasmart-api-qa7w.onrender.com`) and CORS origins set to your frontend origin. Vite build variables require a frontend rebuild.
+
+## Milestone 3 — Branches & Staff (October 2026)
+
+New owner-only **Branches & Staff** navigation:
+- Create branches with unique codes under the current tenant.
+- Review branch sales totals, transaction counts and stock quantities.
+- Create staff logins (manager, cashier, accountant) for selected branches; edit their roles/branch access.
+- Transfer stock between branches atomically, with paired audit-ledger entries and required reason.
+- Export branch and staff lists to CSV; existing inventory exports remain available.
+
+### API endpoints
+- `GET /api/v1/branches/summary` — owner branch summary
+- `POST /api/v1/branches` — owner adds branch
+- `GET /api/v1/staff` — owner staff list
+- `POST /api/v1/staff` — owner creates staff account with assigned branches
+- `PATCH /api/v1/staff/{membership_id}` — owner updates role/assigned branches
+- `POST /api/v1/inventory/transfer` — owner or manager transfers stock between authorized branches
+
+### Database and production deployment
+An additive Alembic `0002_staff_branches` migration creates the assignment table. Backend Docker startup runs `alembic upgrade head`. Keep your existing database and secrets; do **not** rebuild the Render Blueprint/database for this upgrade. Ensure the frontend `VITE_API_URL` points to your current backend (e.g. `https://dukasmart-api-qa7w.onrender.com`) and backend `CORS_ORIGINS` points to the frontend URL. Vite embeds environment variables at build time, so rebuild the static site after any change.
+
+### Limitations before live use
+This is a sandbox milestone. Staff accounts use an owner-specified initial password, without email invitations, mandatory password rotation, reset workflows, MFA, or account deactivation UI. Complete these before using with real employees. Only branch inventory, checkout and sales/fiscal visibility have added branch-scoped authorization; audit every remaining endpoint before production. Branch financial summaries aggregate recorded demo transactions, not settled M-Pesa or fiscal receipts. Transfers are immediate source/destination ledger moves, not a two-step goods-in-transit workflow; add approvals and receipt confirmation for higher-risk environments. Do not process live payments or issue tax invoices with mock integrations.

@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from .database import Base, engine, get_db
-from .models import Tenant, User, Membership, Branch, Product, Stock, StockMovement, Sale, SaleLine, Payment, FiscalInvoice
+from .models import Tenant, User, Membership, Branch, Product, Stock, StockMovement, Sale, SaleLine, Payment, FiscalInvoice, StaffBranch
 
 app=FastAPI(title='DukaSmart POS API',version='0.1.0')
 app.add_middleware(CORSMiddleware,allow_origins=os.getenv('CORS_ORIGINS','http://localhost:5173,http://localhost:8000').split(','),allow_credentials=True,allow_methods=['*'],allow_headers=['*'])
@@ -35,6 +35,20 @@ class Login(BaseModel):
 class BranchIn(BaseModel):
     name:str=Field(min_length=1,max_length=100)
     code:str=Field(min_length=1,max_length=30)
+class StaffCreate(BaseModel):
+    email:EmailStr
+    password:str=Field(min_length=12,max_length=128)
+    role:Literal['MANAGER','CASHIER','ACCOUNTANT']
+    branch_ids:list[str]=Field(min_length=1)
+class StaffAssign(BaseModel):
+    role:Literal['MANAGER','CASHIER','ACCOUNTANT']
+    branch_ids:list[str]=Field(min_length=1)
+class TransferIn(BaseModel):
+    source_branch_id:str
+    destination_branch_id:str
+    product_id:str
+    quantity:int=Field(gt=0)
+    reason:str=Field(min_length=5,max_length=160)
 class ProductIn(BaseModel):
     sku:str=Field(min_length=1,max_length=50)
     name:str=Field(min_length=1,max_length=180)
@@ -79,6 +93,10 @@ def auth(authorization:str|None=Header(default=None),db:Session=Depends(get_db))
         if not user or not user.active or not membership:raise ValueError()
         return user,membership
     except Exception:raise HTTPException(401,'Invalid or expired authentication')
+def require_branch_access(db,m,branch_id):
+    if m.role=='OWNER': return
+    assigned=db.scalar(select(StaffBranch).where(StaffBranch.membership_id==m.id,StaffBranch.branch_id==branch_id))
+    if not assigned:raise HTTPException(403,'You do not have access to this branch')
 def branch_for(db,tenant,branch_id):
     x=db.scalar(select(Branch).where(Branch.tenant_id==tenant,Branch.id==branch_id))
     if not x:raise HTTPException(404,'Branch not found')
@@ -115,12 +133,81 @@ def current(user_membership=Depends(auth),db:Session=Depends(get_db)):
     u,m=user_membership;return serial(db.get(Tenant,m.tenant_id))
 @app.get('/api/v1/branches')
 def branches(user_membership=Depends(auth),db:Session=Depends(get_db)):
-    _,m=user_membership;return [serial(x) for x in db.scalars(select(Branch).where(Branch.tenant_id==m.tenant_id))]
+    _,m=user_membership
+    q=select(Branch).where(Branch.tenant_id==m.tenant_id)
+    if m.role!='OWNER':q=q.join(StaffBranch,StaffBranch.branch_id==Branch.id).where(StaffBranch.membership_id==m.id)
+    return [serial(x) for x in db.scalars(q)]
 @app.post('/api/v1/branches',status_code=201)
 def create_branch(data:BranchIn,user_membership=Depends(auth),db:Session=Depends(get_db)):
     _,m=user_membership
     if m.role!='OWNER':raise HTTPException(403,'Owner permission required')
     b=Branch(tenant_id=m.tenant_id,**data.model_dump());db.add(b);unique_or_409(db);db.refresh(b);return serial(b)
+@app.get('/api/v1/staff')
+def list_staff(user_membership=Depends(auth),db:Session=Depends(get_db)):
+    _,m=user_membership
+    if m.role!='OWNER':raise HTTPException(403,'Owner permission required')
+    entries=db.execute(select(Membership,User).join(User,User.id==Membership.user_id).where(Membership.tenant_id==m.tenant_id)).all()
+    return [{'id':mem.id,'email':usr.email,'role':mem.role,'active':usr.active,'branch_ids':list(db.scalars(select(StaffBranch.branch_id).where(StaffBranch.membership_id==mem.id)))} for mem,usr in entries]
+@app.post('/api/v1/staff',status_code=201)
+def create_staff(data:StaffCreate,user_membership=Depends(auth),db:Session=Depends(get_db)):
+    _,m=user_membership
+    if m.role!='OWNER':raise HTTPException(403,'Owner permission required')
+    ids=set(data.branch_ids)
+    valid=set(db.scalars(select(Branch.id).where(Branch.tenant_id==m.tenant_id,Branch.id.in_(ids))))
+    if len(ids)!=len(data.branch_ids) or ids!=valid:raise HTTPException(422,'Select valid unique branches')
+    if db.scalar(select(User).where(User.email==data.email.lower())):raise HTTPException(409,'Email already registered; account linking is not supported in this release')
+    u=User(email=data.email.lower(),password_hash=hasher.hash(data.password))
+    db.add(u);db.flush()
+    membership=Membership(user_id=u.id,tenant_id=m.tenant_id,role=data.role)
+    db.add(membership);db.flush()
+    for bid in ids:db.add(StaffBranch(membership_id=membership.id,branch_id=bid))
+    unique_or_409(db)
+    return {'id':membership.id,'email':u.email,'role':membership.role,'branch_ids':sorted(ids)}
+@app.patch('/api/v1/staff/{membership_id}')
+def update_staff(membership_id:str,data:StaffAssign,user_membership=Depends(auth),db:Session=Depends(get_db)):
+    _,m=user_membership
+    if m.role!='OWNER':raise HTTPException(403,'Owner permission required')
+    target=db.scalar(select(Membership).where(Membership.id==membership_id,Membership.tenant_id==m.tenant_id))
+    if not target or target.role=='OWNER':raise HTTPException(404,'Editable staff membership not found')
+    ids=set(data.branch_ids)
+    valid=set(db.scalars(select(Branch.id).where(Branch.tenant_id==m.tenant_id,Branch.id.in_(ids))))
+    if len(ids)!=len(data.branch_ids) or ids!=valid:raise HTTPException(422,'Select valid unique branches')
+    for row in db.scalars(select(StaffBranch).where(StaffBranch.membership_id==target.id)):db.delete(row)
+    db.flush()
+    for bid in ids:db.add(StaffBranch(membership_id=target.id,branch_id=bid))
+    target.role=data.role;unique_or_409(db)
+    return {'id':target.id,'role':target.role,'branch_ids':sorted(ids)}
+@app.get('/api/v1/branches/summary')
+def branch_summary(user_membership=Depends(auth),db:Session=Depends(get_db)):
+    _,m=user_membership
+    if m.role!='OWNER':raise HTTPException(403,'Owner permission required')
+    out=[]
+    for b in db.scalars(select(Branch).where(Branch.tenant_id==m.tenant_id)):
+        sales=list(db.scalars(select(Sale).where(Sale.tenant_id==m.tenant_id,Sale.branch_id==b.id)))
+        stocks=list(db.scalars(select(Stock).where(Stock.tenant_id==m.tenant_id,Stock.branch_id==b.id)))
+        out.append({'id':b.id,'name':b.name,'code':b.code,'sales_count':len(sales),'sales_total':str(sum((x.total for x in sales),Decimal('0'))),'stock_units':sum(x.qty for x in stocks)})
+    return out
+@app.post('/api/v1/inventory/transfer',status_code=201)
+def transfer_stock(data:TransferIn,user_membership=Depends(auth),db:Session=Depends(get_db)):
+    _,m=user_membership
+    if m.role not in ('OWNER','MANAGER'):raise HTTPException(403)
+    if data.source_branch_id==data.destination_branch_id:raise HTTPException(422,'Choose two different branches')
+    for bid in [data.source_branch_id,data.destination_branch_id]:
+        branch_for(db,m.tenant_id,bid);require_branch_access(db,m,bid)
+    if not db.scalar(select(Product).where(Product.id==data.product_id,Product.tenant_id==m.tenant_id)):raise HTTPException(404,'Product not found')
+    rows=list(db.scalars(select(Stock).where(Stock.tenant_id==m.tenant_id,Stock.product_id==data.product_id,Stock.branch_id.in_([data.source_branch_id,data.destination_branch_id])).order_by(Stock.branch_id).with_for_update()))
+    by_branch={x.branch_id:x for x in rows}
+    source=by_branch.get(data.source_branch_id)
+    if not source or source.qty<data.quantity:raise HTTPException(409,'Insufficient source stock')
+    dest=by_branch.get(data.destination_branch_id)
+    if not dest:
+        dest=Stock(tenant_id=m.tenant_id,branch_id=data.destination_branch_id,product_id=data.product_id,qty=0);db.add(dest)
+    source.qty-=data.quantity;dest.qty+=data.quantity
+    ref='TRANSFER-'+secrets.token_hex(8)
+    for bid,delta in [(data.source_branch_id,-data.quantity),(data.destination_branch_id,data.quantity)]:
+        db.add(StockMovement(tenant_id=m.tenant_id,branch_id=bid,product_id=data.product_id,delta=delta,reason='TRANSFER: '+data.reason,reference=ref))
+    unique_or_409(db)
+    return {'reference':ref,'source_quantity':source.qty,'destination_quantity':dest.qty}
 @app.get('/api/v1/products')
 def products(user_membership=Depends(auth),db:Session=Depends(get_db)):
     _,m=user_membership;return [serial(x) for x in db.scalars(select(Product).where(Product.tenant_id==m.tenant_id).order_by(Product.name))]
@@ -140,14 +227,14 @@ def edit_product(product_id:str,data:ProductEdit,user_membership=Depends(auth),d
 
 @app.get('/api/v1/inventory/movements')
 def inventory_movements(branch_id:str,user_membership=Depends(auth),db:Session=Depends(get_db)):
-    _,m=user_membership;branch_for(db,m.tenant_id,branch_id)
+    _,m=user_membership;branch_for(db,m.tenant_id,branch_id);require_branch_access(db,m,branch_id)
     return [serial(x) for x in db.scalars(select(StockMovement).where(StockMovement.tenant_id==m.tenant_id,StockMovement.branch_id==branch_id).order_by(StockMovement.created_at.desc()).limit(300))]
 
 @app.post('/api/v1/inventory/adjust',status_code=201)
 def adjust_stock(data:StockAdjust,user_membership=Depends(auth),db:Session=Depends(get_db)):
     _,m=user_membership
     if m.role not in ('OWNER','MANAGER'):raise HTTPException(403,'Manager permission required')
-    branch_for(db,m.tenant_id,data.branch_id)
+    branch_for(db,m.tenant_id,data.branch_id);require_branch_access(db,m,data.branch_id)
     p=db.scalar(select(Product).where(Product.id==data.product_id,Product.tenant_id==m.tenant_id))
     if not p:raise HTTPException(404,'Product not found')
     stock=db.scalar(select(Stock).where(Stock.tenant_id==m.tenant_id,Stock.branch_id==data.branch_id,Stock.product_id==data.product_id).with_for_update())
@@ -163,13 +250,13 @@ def adjust_stock(data:StockAdjust,user_membership=Depends(auth),db:Session=Depen
 
 @app.get('/api/v1/inventory')
 def inventory(branch_id:str,user_membership=Depends(auth),db:Session=Depends(get_db)):
-    _,m=user_membership;branch_for(db,m.tenant_id,branch_id)
+    _,m=user_membership;branch_for(db,m.tenant_id,branch_id);require_branch_access(db,m,branch_id)
     return [serial(x) for x in db.scalars(select(Stock).where(Stock.tenant_id==m.tenant_id,Stock.branch_id==branch_id))]
 @app.post('/api/v1/inventory/receive',status_code=201)
 def receive(data:StockIn,user_membership=Depends(auth),db:Session=Depends(get_db)):
     _,m=user_membership
     if m.role not in ('OWNER','MANAGER'):raise HTTPException(403)
-    branch_for(db,m.tenant_id,data.branch_id)
+    branch_for(db,m.tenant_id,data.branch_id);require_branch_access(db,m,data.branch_id)
     p=db.scalar(select(Product).where(Product.id==data.product_id,Product.tenant_id==m.tenant_id))
     if not p:raise HTTPException(404,'Product not found')
     stock=db.scalar(select(Stock).where(Stock.branch_id==data.branch_id,Stock.product_id==data.product_id).with_for_update())
@@ -180,9 +267,10 @@ def receive(data:StockIn,user_membership=Depends(auth),db:Session=Depends(get_db
 @app.post('/api/v1/sales',status_code=201)
 def checkout(data:SaleIn,user_membership=Depends(auth),db:Session=Depends(get_db)):
     user,m=user_membership
+    if m.role not in ('OWNER','MANAGER','CASHIER'):raise HTTPException(403,'Checkout access required')
     existing=db.scalar(select(Sale).where(Sale.tenant_id==m.tenant_id,Sale.idempotency_key==data.idempotency_key))
     if existing:return {'sale_id':existing.id,'total':str(existing.total),'state':existing.state,'replayed':True}
-    branch_for(db,m.tenant_id,data.branch_id)
+    branch_for(db,m.tenant_id,data.branch_id);require_branch_access(db,m,data.branch_id)
     if len({i.product_id for i in data.items})!=len(data.items):raise HTTPException(422,'Duplicate product lines')
     product_ids=[i.product_id for i in data.items]
     products={p.id:p for p in db.scalars(select(Product).where(Product.tenant_id==m.tenant_id,Product.id.in_(product_ids)))}
@@ -204,13 +292,23 @@ def checkout(data:SaleIn,user_membership=Depends(auth),db:Session=Depends(get_db
     return {'sale_id':sale.id,'total':str(total),'state':sale.state,'fiscal_state':'NOT_SUBMITTED','replayed':False}
 @app.get('/api/v1/sales')
 def sales(user_membership=Depends(auth),db:Session=Depends(get_db)):
-    _,m=user_membership;return [serial(x) for x in db.scalars(select(Sale).where(Sale.tenant_id==m.tenant_id).order_by(Sale.created_at.desc()).limit(100))]
+    _,m=user_membership
+    q=select(Sale).where(Sale.tenant_id==m.tenant_id)
+    if m.role!='OWNER':q=q.where(Sale.branch_id.in_(select(StaffBranch.branch_id).where(StaffBranch.membership_id==m.id)))
+    return [serial(x) for x in db.scalars(q.order_by(Sale.created_at.desc()).limit(100))]
 @app.get('/api/v1/fiscal/invoices')
 def fiscal_invoices(user_membership=Depends(auth),db:Session=Depends(get_db)):
-    _,m=user_membership;return [serial(x) for x in db.scalars(select(FiscalInvoice).where(FiscalInvoice.tenant_id==m.tenant_id))]
+    _,m=user_membership
+    q=select(FiscalInvoice).join(Sale,Sale.id==FiscalInvoice.sale_id).where(FiscalInvoice.tenant_id==m.tenant_id)
+    if m.role!='OWNER':q=q.where(Sale.branch_id.in_(select(StaffBranch.branch_id).where(StaffBranch.membership_id==m.id)))
+    return [serial(x) for x in db.scalars(q)]
 @app.post('/api/v1/fiscal/invoices/{sale_id}/simulate')
 def fiscal_simulate(sale_id:str,user_membership=Depends(auth),db:Session=Depends(get_db)):
     _,m=user_membership
+    if m.role not in ('OWNER','MANAGER','ACCOUNTANT'):raise HTTPException(403)
+    sale=db.scalar(select(Sale).where(Sale.id==sale_id,Sale.tenant_id==m.tenant_id))
+    if not sale:raise HTTPException(404)
+    require_branch_access(db,m,sale.branch_id)
     inv=db.scalar(select(FiscalInvoice).where(FiscalInvoice.tenant_id==m.tenant_id,FiscalInvoice.sale_id==sale_id))
     if not inv:raise HTTPException(404)
     # Deliberately never generates a KRA invoice number or a compliant fiscal status.
