@@ -40,6 +40,16 @@ class ProductIn(BaseModel):
     name:str=Field(min_length=1,max_length=180)
     price:Decimal=Field(ge=0,decimal_places=2)
     cost:Decimal=Field(default=Decimal('0'),ge=0,decimal_places=2)
+class ProductEdit(BaseModel):
+    sku:str=Field(min_length=1,max_length=50)
+    name:str=Field(min_length=1,max_length=180)
+    price:Decimal=Field(ge=0,decimal_places=2)
+    cost:Decimal=Field(ge=0,decimal_places=2)
+class StockAdjust(BaseModel):
+    branch_id:str
+    product_id:str
+    new_quantity:int=Field(ge=0)
+    reason:str=Field(min_length=5,max_length=160)
 class StockIn(BaseModel):
     branch_id:str
     product_id:str
@@ -119,6 +129,38 @@ def create_product(data:ProductIn,user_membership=Depends(auth),db:Session=Depen
     _,m=user_membership
     if m.role not in ('OWNER','MANAGER'):raise HTTPException(403)
     p=Product(tenant_id=m.tenant_id,**data.model_dump());db.add(p);unique_or_409(db);db.refresh(p);return serial(p)
+@app.patch('/api/v1/products/{product_id}')
+def edit_product(product_id:str,data:ProductEdit,user_membership=Depends(auth),db:Session=Depends(get_db)):
+    _,m=user_membership
+    if m.role not in ('OWNER','MANAGER'):raise HTTPException(403,'Manager permission required')
+    p=db.scalar(select(Product).where(Product.id==product_id,Product.tenant_id==m.tenant_id))
+    if not p:raise HTTPException(404,'Product not found')
+    for k,v in data.model_dump().items():setattr(p,k,v)
+    unique_or_409(db);db.refresh(p);return serial(p)
+
+@app.get('/api/v1/inventory/movements')
+def inventory_movements(branch_id:str,user_membership=Depends(auth),db:Session=Depends(get_db)):
+    _,m=user_membership;branch_for(db,m.tenant_id,branch_id)
+    return [serial(x) for x in db.scalars(select(StockMovement).where(StockMovement.tenant_id==m.tenant_id,StockMovement.branch_id==branch_id).order_by(StockMovement.created_at.desc()).limit(300))]
+
+@app.post('/api/v1/inventory/adjust',status_code=201)
+def adjust_stock(data:StockAdjust,user_membership=Depends(auth),db:Session=Depends(get_db)):
+    _,m=user_membership
+    if m.role not in ('OWNER','MANAGER'):raise HTTPException(403,'Manager permission required')
+    branch_for(db,m.tenant_id,data.branch_id)
+    p=db.scalar(select(Product).where(Product.id==data.product_id,Product.tenant_id==m.tenant_id))
+    if not p:raise HTTPException(404,'Product not found')
+    stock=db.scalar(select(Stock).where(Stock.tenant_id==m.tenant_id,Stock.branch_id==data.branch_id,Stock.product_id==data.product_id).with_for_update())
+    if stock is None:
+        stock=Stock(tenant_id=m.tenant_id,branch_id=data.branch_id,product_id=data.product_id,qty=0)
+        db.add(stock)
+    delta=data.new_quantity-stock.qty
+    if delta==0:return {'quantity':stock.qty,'delta':0}
+    stock.qty=data.new_quantity
+    db.add(StockMovement(tenant_id=m.tenant_id,branch_id=data.branch_id,product_id=data.product_id,delta=delta,reason='ADJUST: '+data.reason[:32],reference=secrets.token_hex(8)))
+    unique_or_409(db)
+    return {'quantity':stock.qty,'delta':delta}
+
 @app.get('/api/v1/inventory')
 def inventory(branch_id:str,user_membership=Depends(auth),db:Session=Depends(get_db)):
     _,m=user_membership;branch_for(db,m.tenant_id,branch_id)

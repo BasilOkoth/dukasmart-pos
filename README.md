@@ -76,3 +76,12 @@ Visit http://localhost:5173. Run backend tests with `cd backend && pytest -q`.
 
 ## Premium UI design
 The UI uses responsive emerald/teal styling, modern dashboards, accessible labels, a branch selector, product search, fast quantity adjustments, low-stock indication and prominent sandbox notices. Payment and eTIMS mock operations cannot issue compliant receipts or collect funds.
+
+
+## Premium inventory update
+
+- Edit a product name, SKU, selling price and cost price from **Inventory → Edit**. Historic sale line snapshots are preserved.
+- **Receive** stock to add positive quantities, or **Adjust** stock to set a physical count with a required explanation. Stock movements are stored in the ledger.
+- **Download CSV** exports the inventory list; **Download history** exports recent stock movements for the selected branch.
+- Existing PostgreSQL tables remain compatible; no destructive migrations are required for these endpoints.
+- On Render, keep `VITE_API_URL` set to the actual API URL (e.g. `https://dukasmart-api-qa7w.onrender.com`) and CORS origins set to your frontend origin. Vite build variables require a frontend rebuild.
